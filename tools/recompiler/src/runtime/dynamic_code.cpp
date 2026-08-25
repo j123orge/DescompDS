@@ -114,7 +114,6 @@ bool DynamicCodeManager::decode_and_register(uint32_t dest, bool thumb) {
     if (!base || dest >= base_size) return false;
 
     size_t off = dest;
-    if (off >= base_size) return false;
     size_t avail = std::min<size_t>(1024, base_size - off);
     if (avail < 4) return false;
 
@@ -143,7 +142,7 @@ bool DynamicCodeManager::decode_and_register(uint32_t dest, bool thumb) {
     // This will be called from the interpreter which has program access
     // For now, store the function info in the region
     for (auto &r : regions_) {
-        if (r.destination == dest) {
+        if (dest >= r.destination && dest < r.destination + r.size) {
             r.discovered_functions = fit2->second.blocks.size();
             r.discovered_blocks = fit2->second.blocks.size();
             r.is_thumb = false;
