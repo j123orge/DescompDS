@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+build_vs/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.obj
+*.o
+*.exe
+*.lib
+*.dll
+*.bin
+*.pdb
+*.ilk
+
+# Generated output data
+output/
+output_mario/
+output_mario_bak/
+demo_output/
+
+# Editor
+.vscode/
+
+# Stray log files in root
+blocks_output.txt
+modify.txt
+run2.txt
+run_output.txt
+explorer_test_output.txt
+nul)
