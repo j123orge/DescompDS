@@ -21,6 +21,11 @@
 #include "bmd.h"
 #include "romfile.h"
 #include "d3d_view.h"
+#include "neutral_mesh.h"
+#include "model_view.h"
+#include "core/nitro/nitro_rom.h"
+#include "core/render/model.h"
+#include "core/formats/bmd_v2.h"
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -806,39 +811,102 @@ static void populate_blockers(ProjectData& pd) {
 static bmd::Model g_asset_model;
 static bool g_asset_model_loaded = false;
 static HWND hViewport = nullptr;   // embedded D3D viewport (child of main window)
+static HWND hAssetTree = nullptr;  // NitroFS directory tree (ASSETS left pane)
 static int g_sel_asset = 0;        // selected asset row (persists across tab switches)
 static int g_loaded_asset = -1;    // file index currently loaded in the viewport
 
-struct AssetEntry { int file; std::string name; std::string type; };
+struct AssetEntry { int file; std::string name; std::string type; std::string fullName; };
 static std::vector<AssetEntry> g_assets;
+
+// New NitroROM core (P0) — path-based access. romfile.cpp kept temporarily.
+static nitro::NitroROM* g_nitroRom = nullptr;
+static int g_selectedDirIdx = 0;   // index into g_nitroRom->dirEntries()
+static HTREEITEM g_nitroTreeItems[512]; // dir index -> tree item
 
 static std::string g_rom_path;
 
-// Catalog of assets discovered in the ROM (models verified as BMD).
+// Legacy: hardcoded catalog (kept for fallback if NitroROM unavailable)
 static void build_asset_catalog() {
     g_assets.clear();
-    g_assets.push_back({175, "Mario head/cap (file[175])", "MODEL"});
-    g_assets.push_back({1921, "Mario body (file[1921])", "MODEL"});
-    g_assets.push_back({1933, "Mario body variant (file[1933])", "MODEL"});
-    g_assets.push_back({190, "UI model (file[190])", "MODEL"});
-    g_assets.push_back({112, "Audio SDAT (file[112])", "AUDIO"});
+    g_assets.push_back({175, "Mario head/cap (file[175])", "MODEL", "data/DSMT/face_demo_mario.bmd"});
+    g_assets.push_back({1921, "Mario body (file[1921])", "MODEL", "data/DSMT/mario.bmd"});
+    g_assets.push_back({1933, "Mario body variant (file[1933])", "MODEL", "data/DSMT/mario_star.bmd"});
+    g_assets.push_back({190, "UI model (file[190])", "MODEL", "data/2D_dummy.bmd"});
+    g_assets.push_back({112, "Audio SDAT (file[112])", "AUDIO", "data/sound_data.sdat"});
 }
+
+// NitroFS helpers
+static void populate_asset_tree();
+static void populate_asset_list_for_dir(int dirIdx);
 
 static bool load_model_file(int file_index, bmd::Model& out) {
     out = bmd::Model();
-    if (g_rom_path.empty()) return false;
-    std::vector<uint8_t> raw;
-    if (!romfile::read_file(g_rom_path, file_index, raw)) return false;
-    std::vector<uint8_t> dec = romfile::decompress(raw);
+    std::vector<uint8_t> dec;
+    if (g_nitroRom && g_nitroRom->valid()) {
+        try { dec = g_nitroRom->extractAndDecompress((uint16_t)file_index); }
+        catch(...) { return false; }
+    } else {
+        if (g_rom_path.empty()) return false;
+        std::vector<uint8_t> raw;
+        if (!romfile::read_file(g_rom_path, file_index, raw)) return false;
+        dec = romfile::decompress(raw);
+    }
     if (dec.empty()) return false;
     std::string err;
+    // bmd_v2 is now primary (literal SM64DSe port), bmd.cpp kept as LEGACY CANDIDATE
+    if (bmd_v2::parse(dec, out, err)) return true;
     return bmd::parse_model(dec, out, err);
+}
+static bool load_model_by_path(const std::string& fullPath, bmd::Model& out) {
+    out = bmd::Model();
+    if (!g_nitroRom || !g_nitroRom->valid()) return false;
+    try {
+        auto dec = g_nitroRom->getFileFromName(fullPath);
+        std::string err;
+        if (bmd_v2::parse(dec, out, err)) return true;
+        return bmd::parse_model(dec, out, err);
+    } catch(...) { return false; }
+}
+
+static bool sm64dse_export_bmd(const std::string& bmdName, const std::string& outDir) {
+    if (g_rom_path.empty()) return false;
+    std::string cmd = "\"D:\\DescompDS\\harness.exe\" \"" + g_rom_path + "\" \"" + bmdName + "\" \"" + outDir + "\"";
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                             nullptr, nullptr, &si, &pi);
+    if (!ok) return false;
+    WaitForSingleObject(pi.hProcess, 30000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return exitCode == 0;
+}
+
+static bool g_neutral_pipeline_active = false;
+static NeutralMesh g_neutral_model;
+
+static bool try_neutral_pipeline(const std::string& bmdName, const std::string& cacheDir) {
+    std::string objPath = cacheDir + "\\" + bmdName + ".obj";
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(objPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        CreateDirectoryA(cacheDir.c_str(), nullptr);
+        if (!sm64dse_export_bmd(bmdName, cacheDir)) return false;
+    } else {
+        FindClose(hFind);
+    }
+    return load_obj_to_neutral(objPath.c_str(), g_neutral_model);
 }
 
 static void render_asset_in_viewport() {
     if (!hViewport) return;
     if (!d3dview::initialized()) d3dview::init(hViewport);
-    if (g_asset_model_loaded) {
+    if (g_neutral_pipeline_active && !g_neutral_model.empty()) {
+        d3dview::load_neutral_mesh(g_neutral_model, 1);
+        d3dview::focus_model();
+    } else if (g_asset_model_loaded) {
         d3dview::load_model(g_asset_model, 1);
         d3dview::focus_model();
     }
@@ -873,38 +941,72 @@ static void select_asset(int idx) {
     const AssetEntry& a = g_assets[idx];
     std::wstringstream ss;
     ss << L"Asset: " << s2ws(a.name) << L"\n";
+    ss << L"Path: " << s2ws(a.fullName) << L"\n";
     ss << L"Type: " << s2ws(a.type) << L"\n";
-    ss << L"ROM File: " << a.file << L"\n";
-    if (a.type == "MODEL") {
+    ss << L"ROM File: " << a.file << L" (" << s2ws(render::classify_asset(a.fullName)) << L")\n";
+    if (a.type == "MODEL" || a.fullName.size()>=4 && a.fullName.substr(a.fullName.size()-4)==".bmd") {
         bool already = g_asset_model_loaded && (g_loaded_asset == a.file);
         if (!already) {
-            if (!load_model_file(a.file, g_asset_model)) {
-                g_asset_model_loaded = false;
-                ss << L"\nFailed to parse model.\n";
-                SetWindowTextW(hDetails, ss.str().c_str());
-                return;
+            g_neutral_pipeline_active = false;
+            g_neutral_model.clear();
+
+            if (!a.fullName.empty()) {
+                std::string bmdName = a.fullName;
+                size_t lastSlash = bmdName.find_last_of("/\\");
+                if (lastSlash != std::string::npos) bmdName = bmdName.substr(lastSlash + 1);
+                size_t dotPos = bmdName.rfind('.');
+                if (dotPos != std::string::npos) bmdName = bmdName.substr(0, dotPos);
+                std::string cacheDir = "D:\\DescompDS\\cache\\models";
+                if (try_neutral_pipeline(bmdName, cacheDir)) {
+                    g_neutral_pipeline_active = true;
+                    g_asset_model_loaded = true;
+                    g_loaded_asset = a.file;
+                }
             }
-            g_asset_model_loaded = true;
-            g_loaded_asset = a.file;
+
+            if (!g_neutral_pipeline_active) {
+                bool ok = false;
+                if (!a.fullName.empty() && g_nitroRom && g_nitroRom->valid())
+                    ok = load_model_by_path(a.fullName, g_asset_model);
+                if (!ok) ok = load_model_file(a.file, g_asset_model);
+                if (!ok) {
+                    g_asset_model_loaded = false;
+                    ss << L"\nNEUTRAL MODEL PIPELINE FAILED — no fallback.\n";
+                    ss << L"SM64DSe export failed. Model cannot be displayed.\n";
+                    SetWindowTextW(hDetails, ss.str().c_str());
+                    return;
+                }
+                g_asset_model_loaded = true;
+                g_loaded_asset = a.file;
+            }
+            
+            if (g_neutral_pipeline_active) {
+                ss << L"\nMODEL PIPELINE: NEUTRAL / SM64DSe\n";
+                ss << L"  Vertices: " << g_neutral_model.vertices.size() << L"\n";
+                ss << L"  Indices: " << g_neutral_model.indices.size() << L"\n";
+                ss << L"  Submeshes: " << g_neutral_model.submeshes.size() << L"\n";
+                ss << L"  Materials: " << g_neutral_model.materials.size() << L"\n";
+            } else {
+                ss << L"\nGeometry\n";
+                ss << L"  Vertices: " << g_asset_model.gx_vertices << L"\n";
+                ss << L"  Triangles: " << count_triangles(g_asset_model) << L"\n";
+                ss << L"  GX Primitive Groups: " << count_prim_groups(g_asset_model) << L"\n";
+                ss << L"  Bones: " << g_asset_model.bones.size() << L"\n";
+                ss << L"  Materials: " << g_asset_model.materials.size() << L"\n";
+                ss << L"  Textures: " << g_asset_model.textures.size() << L"\n";
+                if (g_asset_model.has_bbox) {
+                    ss << L"\nRaw Bounds\n";
+                    ss << bbox_line(g_asset_model.minx, g_asset_model.miny, g_asset_model.minz,
+                                    g_asset_model.maxx, g_asset_model.maxy, g_asset_model.maxz);
+                }
+                if (g_asset_model.has_wbbox) {
+                    ss << L"\nWorld Bounds\n";
+                    ss << bbox_line(g_asset_model.wminx, g_asset_model.wminy, g_asset_model.wminz,
+                                    g_asset_model.wmaxx, g_asset_model.wmaxy, g_asset_model.wmaxz);
+                }
+            }
+            render_asset_in_viewport();
         }
-        ss << L"\nGeometry\n";
-        ss << L"  Vertices: " << g_asset_model.gx_vertices << L"\n";
-        ss << L"  Triangles: " << count_triangles(g_asset_model) << L"\n";
-        ss << L"  GX Primitive Groups: " << count_prim_groups(g_asset_model) << L"\n";
-        ss << L"  Bones: " << g_asset_model.bones.size() << L"\n";
-        ss << L"  Materials: " << g_asset_model.materials.size() << L"\n";
-        ss << L"  Textures: " << g_asset_model.textures.size() << L"\n";
-        if (g_asset_model.has_bbox) {
-            ss << L"\nRaw Bounds\n";
-            ss << bbox_line(g_asset_model.minx, g_asset_model.miny, g_asset_model.minz,
-                            g_asset_model.maxx, g_asset_model.maxy, g_asset_model.maxz);
-        }
-        if (g_asset_model.has_wbbox) {
-            ss << L"\nWorld Bounds\n";
-            ss << bbox_line(g_asset_model.wminx, g_asset_model.wminy, g_asset_model.wminz,
-                            g_asset_model.wmaxx, g_asset_model.wmaxy, g_asset_model.wmaxz);
-        }
-        render_asset_in_viewport();
     } else {
         ss << L"\nNo 3D visualization available for this asset type.\n";
         ss << L"(view only properties)";
@@ -913,28 +1015,115 @@ static void select_asset(int idx) {
     SetWindowTextW(hDetails, ss.str().c_str());
 }
 
-static void populate_assets(ProjectData& pd){
-    if (hListView) clear_list(hListView);
-    if (g_assets.empty()) build_asset_catalog();
-    add_list_column(hListView, 0, L"Asset", 220);
-    add_list_column(hListView, 1, L"Type", 80);
-    add_list_column(hListView, 2, L"File", 60);
-    int idx = 0;
-    for (auto& a : g_assets) {
-        LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = idx; it.pszText = (LPWSTR)s2ws(a.name).c_str();
+static void populate_asset_tree() {
+    if (!hAssetTree || !g_nitroRom || !g_nitroRom->valid()) return;
+    TreeView_DeleteAllItems(hAssetTree);
+    memset(g_nitroTreeItems, 0, sizeof(g_nitroTreeItems));
+    auto& dirs = g_nitroRom->dirEntries();
+    // Insert root first
+    TVINSERTSTRUCTW ins{}; ins.hParent = TVI_ROOT; ins.hInsertAfter = TVI_LAST;
+    ins.item.mask = TVIF_TEXT | TVIF_PARAM;
+    std::wstring rootLabel = L"/ (root)";
+    ins.item.pszText = (LPWSTR)rootLabel.c_str();
+    ins.item.lParam = 0;
+    g_nitroTreeItems[0] = TreeView_InsertItem(hAssetTree, &ins);
+    // Insert other dirs sorted by fullName depth
+    for (size_t i=1;i<dirs.size();i++) {
+        auto& d = dirs[i];
+        if (d.name.empty() && d.fullName.empty()) continue;
+        int parentIdx = (d.parent>=0xF000)?(d.parent-0xF000):0;
+        HTREEITEM hParent = g_nitroTreeItems[parentIdx] ? g_nitroTreeItems[parentIdx] : g_nitroTreeItems[0];
+        TVINSERTSTRUCTW ins2{}; ins2.hParent = hParent; ins2.hInsertAfter = TVI_LAST;
+        ins2.item.mask = TVIF_TEXT | TVIF_PARAM;
+        std::wstring label = s2ws(d.name.empty()?d.fullName:d.name);
+        // Keep label alive via static? Use wstring copy via lParam storage trick: allocate via _wcsdup
+        // For simplicity, use temporary and TV will copy? Need to keep alive — store in dirs name.
+        ins2.item.pszText = (LPWSTR)label.c_str();
+        ins2.item.lParam = (LPARAM)i;
+        // Need to guarantee string stays alive until InsertItem returns — it does (copy).
+        // But label is temporary; use lParam to identify, and let tree copy text.
+        // Workaround: use SetWindowText after? Simpler: keep label in a static vector.
+        g_nitroTreeItems[i] = TreeView_InsertItem(hAssetTree, &ins2);
+        // Fix text via TreeView_SetItem (ensure copy)
+        TVITEMW ti{}; ti.mask=TVIF_TEXT; ti.hItem=g_nitroTreeItems[i];
+        std::wstring* keep = new std::wstring(label);
+        ti.pszText=(LPWSTR)keep->c_str();
+        TreeView_SetItem(hAssetTree, &ti);
+    }
+    TreeView_Expand(hAssetTree, g_nitroTreeItems[0], TVE_EXPAND);
+}
+static void populate_asset_list_for_dir(int dirIdx) {
+    if (!hListView) return;
+    clear_list(hListView);
+    g_assets.clear();
+    if (!g_nitroRom || !g_nitroRom->valid()) { build_asset_catalog(); return; }
+    auto& files = g_nitroRom->fileEntries();
+    uint16_t wantParent = (uint16_t)(0xF000 + dirIdx);
+    for (auto& fe: files) {
+        if (fe.parent != wantParent) continue;
+        if (fe.name.empty()) continue;
+        AssetEntry ae;
+        ae.file = fe.id;
+        ae.name = fe.name;
+        ae.fullName = fe.fullName;
+        ae.type = render::classify_asset(fe.fullName);
+        g_assets.push_back(ae);
+    }
+    add_list_column(hListView, 0, L"File", 240);
+    add_list_column(hListView, 1, L"Type", 90);
+    add_list_column(hListView, 2, L"ID", 60);
+    add_list_column(hListView, 3, L"Size", 80);
+    int idx=0;
+    for (auto& a: g_assets) {
+        LVITEMW it{}; it.mask=LVIF_TEXT; it.iItem=idx; it.pszText=(LPWSTR)s2ws(a.name).c_str();
         ListView_InsertItem(hListView, &it);
         set_lv(hListView, idx, 1, s2ws(a.type));
         set_lv(hListView, idx, 2, std::to_wstring(a.file));
+        auto& fe = g_nitroRom->fileEntries()[a.file];
+        set_lv(hListView, idx, 3, std::to_wstring(fe.size));
         idx++;
     }
-    // Re-select the saved asset (first open defaults to 0). select_asset skips reload
-    // if the same model is already loaded.
-    if (g_sel_asset < 0 || g_sel_asset >= (int)g_assets.size()) g_sel_asset = 0;
-    if (!g_assets.empty()) {
-        select_asset(g_sel_asset);
-        ListView_SetItemState(hListView, g_sel_asset, LVIS_SELECTED|LVIS_FOCUSED, LVIS_SELECTED|LVIS_FOCUSED);
-        ListView_EnsureVisible(hListView, g_sel_asset, FALSE);
+    if (g_assets.empty()) {
+        LVITEMW it{}; it.mask=LVIF_TEXT; it.iItem=0; it.pszText=(LPWSTR)L"(empty)";
+        ListView_InsertItem(hListView,&it);
     }
+}
+static void populate_assets(ProjectData& pd){
+    if (!g_nitroRom || !g_nitroRom->valid()) {
+        if (hAssetTree) ShowWindow(hAssetTree, SW_HIDE);
+        if (hListView) clear_list(hListView);
+        if (g_assets.empty()) build_asset_catalog();
+        add_list_column(hListView, 0, L"Asset", 220);
+        add_list_column(hListView, 1, L"Type", 80);
+        add_list_column(hListView, 2, L"File", 60);
+        int idx = 0;
+        for (auto& a : g_assets) {
+            LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = idx; it.pszText = (LPWSTR)s2ws(a.name).c_str();
+            ListView_InsertItem(hListView, &it);
+            set_lv(hListView, idx, 1, s2ws(a.type));
+            set_lv(hListView, idx, 2, std::to_wstring(a.file));
+            idx++;
+        }
+        if (g_sel_asset < 0 || g_sel_asset >= (int)g_assets.size()) g_sel_asset = 0;
+        if (!g_assets.empty()) {
+            select_asset(g_sel_asset);
+            ListView_SetItemState(hListView, g_sel_asset, LVIS_SELECTED|LVIS_FOCUSED, LVIS_SELECTED|LVIS_FOCUSED);
+            ListView_EnsureVisible(hListView, g_sel_asset, FALSE);
+        }
+        return;
+    }
+    // NitroFS mode: tree + filtered list
+    if (hAssetTree) ShowWindow(hAssetTree, SW_SHOW);
+    populate_asset_tree();
+    // Select previously selected dir or root
+    if (g_selectedDirIdx <0 || g_selectedDirIdx >= (int)g_nitroRom->dirEntries().size()) g_selectedDirIdx=0;
+    if (g_nitroTreeItems[g_selectedDirIdx])
+        TreeView_SelectItem(hAssetTree, g_nitroTreeItems[g_selectedDirIdx]);
+    populate_asset_list_for_dir(g_selectedDirIdx);
+    std::wstringstream ss;
+    ss << L"NitroFS: " << g_nitroRom->fileEntries().size() << L" files, "
+       << g_nitroRom->dirEntries().size() << L" dirs. Select a folder left, file center, preview right.";
+    SetWindowTextW(hDetails, ss.str().c_str());
 }
 static void populate_game_objects(ProjectData& pd){
     if (hListView) clear_list(hListView);
@@ -1104,6 +1293,7 @@ static void log_tab_items(int tab, ProjectData& pd){
 
 static void populate_tab(int tabIdx, ProjectData& pd) {
     if (hViewport) ShowWindow(hViewport, tabIdx == 6 ? SW_SHOW : SW_HIDE);
+    if (hAssetTree) ShowWindow(hAssetTree, tabIdx == 6 ? SW_SHOW : SW_HIDE);
     bool isFn = (tabIdx == 11);
     if (hRefView) ShowWindow(hRefView, isFn ? SW_SHOW : SW_HIDE);
     if (hGoEdit) ShowWindow(hGoEdit, isFn ? SW_SHOW : SW_HIDE);
@@ -1166,6 +1356,23 @@ static LRESULT CALLBACK ViewportProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             if (wp == 'W' || wp == 'w') d3dview::load_model(g_asset_model, 0);
             if (wp == 'S' || wp == 's') d3dview::load_model(g_asset_model, 1);
             if (wp == 'B' || wp == 'b') d3dview::load_model(g_asset_model, 2);
+            if (wp == 'G' || wp == 'g') {
+                int cur = d3dview::get_debug_group();
+                int next = cur+1;
+                if(next >= (int)g_asset_model.groups.size()) next=-1;
+                d3dview::set_debug_group(next);
+                std::wstringstream ss; ss << L"Debug group: " << (next==-1?L"ALL":std::to_wstring(next)) << L" / " << g_asset_model.groups.size();
+                SetWindowTextW(hDetails, ss.str().c_str());
+            }
+            if (wp == 'P' || wp == 'p') {
+                int pm = (d3dview::get_primitive_mode() + 1) % 5;
+                d3dview::set_primitive_mode(pm);
+                const char* modes[] = {"ALL","TRIANGLES","QUADS","TRISTRIP","QUADSTRIP"};
+                std::wstringstream ss; ss << L"Primitive mode: " << s2ws(modes[pm]);
+                SetWindowTextW(hDetails, ss.str().c_str());
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -1179,14 +1386,26 @@ static void layout_controls(HWND hWnd) {
     const int tabHeight = 26;
     SetWindowPos(hTabCtrl, nullptr, 0, 0, rc.right, tabHeight, SWP_NOZORDER);
     const int mid = (rc.bottom - tabHeight) / 2 + tabHeight;
-    if (currentTab == 6) { // ASSETS: list left, 3D viewport right, properties bottom
-        int detH = 150;
-        int listW = rc.right * 38 / 100;
-        int vpX = listW, vpW = rc.right - listW;
-        int bodyBottom = rc.bottom - detH;
-        SetWindowPos(hListView, nullptr, 0, tabHeight, listW, bodyBottom - tabHeight, SWP_NOZORDER);
-        SetWindowPos(hViewport, nullptr, vpX, tabHeight, vpW, bodyBottom - tabHeight, SWP_NOZORDER);
-        SetWindowPos(hDetails, nullptr, 0, bodyBottom, rc.right, detH, SWP_NOZORDER);
+    if (currentTab == 6) { // ASSETS: tree left | list center | viewport right, details bottom
+        int detH = 130;
+        if (g_nitroRom && g_nitroRom->valid() && hAssetTree) {
+            int treeW = rc.right * 22 / 100;
+            int listW = rc.right * 30 / 100;
+            int vpX = treeW + listW, vpW = rc.right - treeW - listW;
+            int bodyBottom = rc.bottom - detH;
+            SetWindowPos(hAssetTree, nullptr, 0, tabHeight, treeW, bodyBottom - tabHeight, SWP_NOZORDER);
+            SetWindowPos(hListView, nullptr, treeW, tabHeight, listW, bodyBottom - tabHeight, SWP_NOZORDER);
+            SetWindowPos(hViewport, nullptr, vpX, tabHeight, vpW, bodyBottom - tabHeight, SWP_NOZORDER);
+            SetWindowPos(hDetails, nullptr, 0, bodyBottom, rc.right, detH, SWP_NOZORDER);
+        } else {
+            int listW = rc.right * 38 / 100;
+            int vpX = listW, vpW = rc.right - listW;
+            int bodyBottom = rc.bottom - detH;
+            SetWindowPos(hListView, nullptr, 0, tabHeight, listW, bodyBottom - tabHeight, SWP_NOZORDER);
+            if (hAssetTree) ShowWindow(hAssetTree, SW_HIDE);
+            SetWindowPos(hViewport, nullptr, vpX, tabHeight, vpW, bodyBottom - tabHeight, SWP_NOZORDER);
+            SetWindowPos(hDetails, nullptr, 0, bodyBottom, rc.right, detH, SWP_NOZORDER);
+        }
     } else if (currentTab == 11) { // FUNCTIONS: search, list, details left + references right + Go bar
         int dW = rc.right * 62 / 100;          // details width
         int botTop = mid, botH = rc.bottom - mid;
@@ -1208,7 +1427,7 @@ static void layout_controls(HWND hWnd) {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
-            INITCOMMONCONTROLSEX icex{sizeof(icex), ICC_LISTVIEW_CLASSES|ICC_TAB_CLASSES};
+            INITCOMMONCONTROLSEX icex{sizeof(icex), ICC_LISTVIEW_CLASSES|ICC_TAB_CLASSES|ICC_TREEVIEW_CLASSES};
             InitCommonControlsEx(&icex);
             RECT rc; GetClientRect(hWnd,&rc);
             const int tabHeight=26;
@@ -1225,6 +1444,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 0,0,0,0,hWnd,(HMENU)7,GetModuleHandle(nullptr),nullptr);
             hSearchEdit = CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|ES_AUTOHSCROLL,
                 0,0,0,0,hWnd,(HMENU)9,GetModuleHandle(nullptr),nullptr);
+            hAssetTree = CreateWindowExW(WS_EX_CLIENTEDGE, L"SysTreeView32", L"",
+                WS_CHILD|WS_BORDER|TVS_HASLINES|TVS_HASBUTTONS|TVS_LINESATROOT|TVS_SHOWSELALWAYS,
+                0,0,0,0,hWnd,(HMENU)10,GetModuleHandle(nullptr),nullptr);
             // embedded 3D viewport (child window, drives D3D11 renderer)
             {
                 WNDCLASSW vwc{};
@@ -1243,6 +1465,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(hGoEdit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
             SendMessageW(hGoButton, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
             SendMessageW(hSearchEdit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            if (hAssetTree) SendMessageW(hAssetTree, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
             build_addr_index();
             layout_controls(hWnd);
             populate_tab(0,g_data);
@@ -1357,6 +1580,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (row>=0 && row<(int)g_trace_order.size())
                         goto_address(g_data.trace[g_trace_order[row]].func);
                 }
+            } else if(hdr->idFrom==10 && hdr->code==TVN_SELCHANGED){
+                if (currentTab==6) {
+                    NMTREEVIEWW* nmtv=(NMTREEVIEWW*)lParam;
+                    int dirIdx=(int)nmtv->itemNew.lParam;
+                    g_selectedDirIdx=dirIdx;
+                    populate_asset_list_for_dir(dirIdx);
+                    if (g_nitroRom && dirIdx < (int)g_nitroRom->dirEntries().size()) {
+                        auto& de = g_nitroRom->dirEntries()[dirIdx];
+                        std::wstringstream ss;
+                        ss << L"Directory: " << s2ws(de.fullName.empty()?std::string("/"):de.fullName) << L"\n";
+                        ss << L"Files: " << g_assets.size() << L" in this folder\n";
+                        ss << L"Select a file in the center list to preview.";
+                        SetWindowTextW(hDetails, ss.str().c_str());
+                    }
+                }
             } else if(hdr->idFrom==5 && hdr->code==LVN_ITEMCHANGED){
                 NMLISTVIEW* lv=(NMLISTVIEW*)lParam;
                 if(currentTab==11 && (lv->uNewState & LVIS_SELECTED) && !(lv->uOldState & LVIS_SELECTED)){
@@ -1389,6 +1627,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                     }
                 }
+            }
+            break;
+        }
+        case WM_KEYDOWN: {
+            if (currentTab==6 && (wParam=='G' || wParam=='g')) {
+                int cur = d3dview::get_debug_group();
+                int next = cur+1;
+                if(next >= (int)g_asset_model.groups.size()) next=-1;
+                d3dview::set_debug_group(next);
+                std::wstringstream ss; ss << L"Debug group: " << (next==-1?L"ALL":std::to_wstring(next)) << L" / " << g_asset_model.groups.size() << L"\nPressione G novamente para proximo grupo.";
+                SetWindowTextW(hDetails, ss.str().c_str());
+                InvalidateRect(hViewport, nullptr, FALSE);
+                return 0;
             }
             break;
         }
@@ -1440,6 +1691,9 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdS
         if (attr == INVALID_FILE_ATTRIBUTES) cand = "D:/DescompDS/roms/Mario.nds";
         g_rom_path = cand;
     }
+
+    // Init NitroROM core (P0) — path-based NitroFS, keeps romfile.cpp as fallback
+    try { g_nitroRom = new nitro::NitroROM(g_rom_path); } catch(...) { g_nitroRom = nullptr; }
 
     std::string diag;
     load_data(dir, g_data, diag);

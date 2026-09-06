@@ -59,6 +59,7 @@ struct Texture {
     uint32_t size = 0;
     int width = 0, height = 0;
     uint32_t params = 0;
+    std::vector<uint8_t> decoded; // width*height*4 BGRA
 };
 
 struct MaterialGroup {
@@ -67,9 +68,12 @@ struct MaterialGroup {
     std::string mat_name;
     uint32_t poly_attribs = 0;
     int bone_index = 0;
+    uint32_t tex_id = 0xFFFFFFFF;
     // matrix_id -> bone id (from the display list's transform list + bone map)
     std::vector<int> bone_ids;
     std::vector<Primitive> prims;   // geometry for this group
+    float tex_scale_u = 1.0f, tex_scale_v = 1.0f;
+    float tex_trans_u = 0.0f, tex_trans_v = 0.0f;
 };
 
 struct Model {

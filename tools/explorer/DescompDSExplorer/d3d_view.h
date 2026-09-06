@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "bmd.h"
+#include "neutral_mesh.h"
 
 namespace d3dview {
 
@@ -18,6 +19,9 @@ bool init(HWND hwnd);
 // Load a bmd model into the renderer (converts primitives to triangles).
 // mode 0 = wireframe, 1 = solid, 2 = solid+wireframe.
 bool load_model(const bmd::Model& model, int mode);
+
+// Load a neutral mesh (from OBJ) into the renderer. mode 0=wire, 1=solid.
+bool load_neutral_mesh(const NeutralMesh& mesh, int mode);
 
 // Render one frame (called on WM_PAINT).
 void render();
@@ -38,6 +42,12 @@ bool save_frame_bmp(const char* path);
 
 // Capture the next rendered frame to the given path (saved before Present).
 void set_save_path(const char* path);
+
+void set_debug_group(int idx);
+int get_debug_group();
+
+int get_primitive_mode();
+void set_primitive_mode(int mode);
 
 void shutdown();
 

@@ -196,6 +196,8 @@ bool parse_model(const std::vector<uint8_t>& d, Model& out, std::string& err) {
         MaterialGroup group;
         group.poly_id = pi;
         Primitive* open_prim = nullptr;
+        // TMP debug
+        // printf("  DL pi=%d dl_off=0x%X dloff=0x%X dlsize=%d numtr=%d\n", pi, dl_off, dloff, dlsize, numtr);
         // bone_ids: matrix_id -> bone id (transform list bytes -> bone map shorts)
         for (uint32_t tb = 0; tb < numtr; tb++) {
             uint8_t idx1 = rd8(d, troff + tb);
@@ -256,11 +258,10 @@ bool parse_model(const std::vector<uint8_t>& d, Model& out, std::string& err) {
                         int16_t x = (int16_t)(p1 & 0xFFFF);
                         int16_t y = (int16_t)(p1 >> 16);
                         int16_t z = (int16_t)(p2 & 0xFFFF);
-                        Vertex v = cur;
-                        v.x = (float)x / 4096.0f * out.scale_factor;
-                        v.y = (float)y / 4096.0f * out.scale_factor;
-                        v.z = (float)z / 4096.0f * out.scale_factor;
-                        if (open_prim) { open_prim->verts.push_back(v); out.gx_vertices++; }
+                        cur.x = (float)x / 4096.0f * out.scale_factor;
+                        cur.y = (float)y / 4096.0f * out.scale_factor;
+                        cur.z = (float)z / 4096.0f * out.scale_factor;
+                        if (open_prim) { open_prim->verts.push_back(cur); out.gx_vertices++; }
                         break;
                     }
                     case 0x24: { // vertex XYZ packed
@@ -268,34 +269,48 @@ bool parse_model(const std::vector<uint8_t>& d, Model& out, std::string& err) {
                         int16_t x = (int16_t)((param << 6) & 0xFFC0);
                         int16_t y = (int16_t)((param >> 4) & 0xFFC0);
                         int16_t z = (int16_t)((param >> 14) & 0xFFC0);
-                        Vertex v = cur;
-                        v.x = (float)x / 4096.0f * out.scale_factor;
-                        v.y = (float)y / 4096.0f * out.scale_factor;
-                        v.z = (float)z / 4096.0f * out.scale_factor;
-                        if (open_prim) { open_prim->verts.push_back(v); out.gx_vertices++; }
+                        cur.x = (float)x / 4096.0f * out.scale_factor;
+                        cur.y = (float)y / 4096.0f * out.scale_factor;
+                        cur.z = (float)z / 4096.0f * out.scale_factor;
+                        if (open_prim) { open_prim->verts.push_back(cur); out.gx_vertices++; }
                         break;
                     }
-                    case 0x25: case 0x26: case 0x27: { // vertex 2-coord
+                    case 0x25: { // vertex XY (Z carries over from cur)
                         uint32_t param = rd32(d, pos); pos += 4;
                         int16_t a = (int16_t)(param & 0xFFFF);
                         int16_t b = (int16_t)(param >> 16);
-                        Vertex v = cur;
-                        if (c == 0x25) { v.x = (float)a / 4096.0f * out.scale_factor; v.y = (float)b / 4096.0f * out.scale_factor; }
-                        else if (c == 0x26) { v.x = (float)a / 4096.0f * out.scale_factor; v.z = (float)b / 4096.0f * out.scale_factor; }
-                        else { v.y = (float)a / 4096.0f * out.scale_factor; v.z = (float)b / 4096.0f * out.scale_factor; }
-                        if (open_prim) { open_prim->verts.push_back(v); out.gx_vertices++; }
+                        cur.x = (float)a / 4096.0f * out.scale_factor;
+                        cur.y = (float)b / 4096.0f * out.scale_factor;
+                        if (open_prim) { open_prim->verts.push_back(cur); out.gx_vertices++; }
                         break;
                     }
-                    case 0x28: { // vertex delta
+                    case 0x26: { // vertex XZ (Y carries over from cur)
+                        uint32_t param = rd32(d, pos); pos += 4;
+                        int16_t a = (int16_t)(param & 0xFFFF);
+                        int16_t b = (int16_t)(param >> 16);
+                        cur.x = (float)a / 4096.0f * out.scale_factor;
+                        cur.z = (float)b / 4096.0f * out.scale_factor;
+                        if (open_prim) { open_prim->verts.push_back(cur); out.gx_vertices++; }
+                        break;
+                    }
+                    case 0x27: { // vertex YZ (X carries over from cur)
+                        uint32_t param = rd32(d, pos); pos += 4;
+                        int16_t a = (int16_t)(param & 0xFFFF);
+                        int16_t b = (int16_t)(param >> 16);
+                        cur.y = (float)a / 4096.0f * out.scale_factor;
+                        cur.z = (float)b / 4096.0f * out.scale_factor;
+                        if (open_prim) { open_prim->verts.push_back(cur); out.gx_vertices++; }
+                        break;
+                    }
+                    case 0x28: { // vertex delta — accumulate on cur position
                         uint32_t param = rd32(d, pos); pos += 4;
                         int16_t x = (int16_t)((param << 6) & 0xFFC0);
                         int16_t y = (int16_t)((param >> 4) & 0xFFC0);
                         int16_t z = (int16_t)((param >> 14) & 0xFFC0);
-                        Vertex v = cur;
-                        v.x += (float)x / 262144.0f * out.scale_factor;
-                        v.y += (float)y / 262144.0f * out.scale_factor;
-                        v.z += (float)z / 262144.0f * out.scale_factor;
-                        if (open_prim) { open_prim->verts.push_back(v); out.gx_vertices++; }
+                        cur.x += (float)x / 262144.0f * out.scale_factor;
+                        cur.y += (float)y / 262144.0f * out.scale_factor;
+                        cur.z += (float)z / 262144.0f * out.scale_factor;
+                        if (open_prim) { open_prim->verts.push_back(cur); out.gx_vertices++; }
                         break;
                     }
                     case 0x29: case 0x2A: case 0x2B: pos += 4; break;

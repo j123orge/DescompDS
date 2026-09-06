@@ -13,6 +13,8 @@ namespace {
 struct Viewer {
     HWND hwnd = nullptr;
     bmd::Model model;
+    NeutralMesh neutral_mesh;
+    bool is_neutral = false;
     bool dragging = false;
     int lastx = 0, lasty = 0;
 };
@@ -26,7 +28,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             v = (Viewer*)((CREATESTRUCT*)lp)->lpCreateParams;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)v);
             if (d3dview::init(hwnd)) {
-                d3dview::load_model(v->model, 1);
+                if (v->is_neutral)
+                    d3dview::load_neutral_mesh(v->neutral_mesh, 1);
+                else
+                    d3dview::load_model(v->model, 1);
                 d3dview::reset_camera();
             }
             return 0;
@@ -34,7 +39,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE: {
             if (v && d3dview::initialized()) {
                 d3dview::shutdown();
-                if (d3dview::init(hwnd)) d3dview::load_model(v->model, 1);
+                if (d3dview::init(hwnd)) {
+                    if (v->is_neutral)
+                        d3dview::load_neutral_mesh(v->neutral_mesh, 1);
+                    else
+                        d3dview::load_model(v->model, 1);
+                }
             }
             return 0;
         }
@@ -67,9 +77,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN: {
             if (wp == 'R' || wp == 'r') { d3dview::reset_camera(); d3dview::focus_model(); }
             if (wp == 'F' || wp == 'f') d3dview::focus_model();
-            if (wp == 'W' || wp == 'w') d3dview::load_model(v->model, 0);
-            if (wp == 'S' || wp == 's') d3dview::load_model(v->model, 1);
-            if (wp == 'B' || wp == 'b') d3dview::load_model(v->model, 2);
+            if (!v->is_neutral) {
+                if (wp == 'W' || wp == 'w') d3dview::load_model(v->model, 0);
+                if (wp == 'S' || wp == 's') d3dview::load_model(v->model, 1);
+                if (wp == 'B' || wp == 'b') d3dview::load_model(v->model, 2);
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -95,6 +107,28 @@ void show(const bmd::Model& model, const std::string& title) {
 
     Viewer* v = new Viewer();
     v->model = model;
+    v->is_neutral = false;
+    g_viewers.push_back(v);
+
+    std::wstring wtitle(title.begin(), title.end());
+    v->hwnd = CreateWindowExW(0, L"DescompDSModelView", wtitle.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 100, 900, 700,
+        nullptr, nullptr, wc.hInstance, v);
+    ShowWindow(v->hwnd, SW_SHOW);
+    UpdateWindow(v->hwnd);
+}
+
+void show_neutral(const NeutralMesh& mesh, const std::string& title) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"DescompDSModelView";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    Viewer* v = new Viewer();
+    v->neutral_mesh = mesh;
+    v->is_neutral = true;
     g_viewers.push_back(v);
 
     std::wstring wtitle(title.begin(), title.end());

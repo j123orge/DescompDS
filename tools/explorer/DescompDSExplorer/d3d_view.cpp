@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <string>
+
+#include "stb_image.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -36,12 +39,19 @@ ID3D11Buffer* g_cb = nullptr;
 ID3D11Buffer* g_model_vb = nullptr;
 ID3D11Buffer* g_model_ib = nullptr;
 UINT g_model_vcount = 0, g_model_icount = 0;
+ID3D11ShaderResourceView* g_model_srv = nullptr;
+ID3D11SamplerState* g_model_sampler = nullptr;
+struct DrawGroupInfo { uint32_t idxCount=0, idxOffset=0; int texIdx=-1; uint32_t polyAttrib=0; };
+std::vector<DrawGroupInfo> g_drawGroups;
+std::vector<ID3D11ShaderResourceView*> g_texSRVs;
 
 // debug geometry (axes + bbox): line list
 ID3D11Buffer* g_dbg_vb = nullptr;
 UINT g_dbg_vcount = 0;
 
 int g_render_mode = 1;
+int g_primitive_mode = 0; // 0=ALL, 1=TRIANGLES, 2=QUADS, 3=TRISTRIP, 4=QUADSTRIP
+int g_debug_group = -1; // -1 = all groups
 const char* g_save_path = nullptr;
 
 // camera
@@ -52,21 +62,23 @@ int g_win_w = 800, g_win_h = 600;
 
 struct CB { XMMATRIX W; XMMATRIX V; XMMATRIX P; XMFLOAT4 color; };
 
-struct PVertex { float x, y, z; float nx, ny, nz; };
+struct PVertex { float x, y, z; float nx, ny, nz; float u, v; };
 
 const char* k_vs_src =
     "cbuffer CB : register(b0) { row_major float4x4 W; row_major float4x4 V; row_major float4x4 P; float4 Color; };\n"
-    "struct VIn { float3 p : POS; float3 n : NORMAL; };\n"
-    "struct VOut { float4 p : SV_Position; float3 n : NORMAL; };\n"
+    "struct VIn { float3 p : POS; float3 n : NORMAL; float2 t : TEXCOORD; };\n"
+    "struct VOut { float4 p : SV_Position; float3 n : NORMAL; float2 t : TEXCOORD; };\n"
     "VOut main(VIn i) { VOut o; float4 wp = mul(float4(i.p,1), W); "
-    "o.p = mul(mul(wp, V), P); o.n = i.n; return o; }\n";
+    "o.p = mul(mul(wp, V), P); o.n = i.n; o.t = i.t; return o; }\n";
 
 const char* k_ps_src =
+    "Texture2D tex0 : register(t0); SamplerState samp0 : register(s0);\n"
     "cbuffer CB : register(b0) { row_major float4x4 W; row_major float4x4 V; row_major float4x4 P; float4 Color; };\n"
-    "struct VOut { float4 p : SV_Position; float3 n : NORMAL; };\n"
+    "struct VOut { float4 p : SV_Position; float3 n : NORMAL; float2 t : TEXCOORD; };\n"
     "float4 main(VOut i) : SV_Target { "
-    "float l = (Color.a > 0.5) ? 1.0 : max(dot(normalize(i.n), float3(0.3,0.5,0.8)), 0.15); "
-    "return float4(Color.rgb * l, 1.0); }\n";
+    "float4 tc = tex0.Sample(samp0, i.t); "
+    "if(tc.a < 0.1) discard; "
+    "return float4(tc.rgb * Color.rgb, 1.0); }\n";
 
 bool create_shaders() {
     ID3DBlob* vsb = nullptr; ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
@@ -83,8 +95,9 @@ bool create_shaders() {
     D3D11_INPUT_ELEMENT_DESC desc[] = {
         {"POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    g_dev->CreateInputLayout(desc, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_layout);
+    g_dev->CreateInputLayout(desc, 3, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_layout);
 
     D3D11_BUFFER_DESC cbd{};
     cbd.ByteWidth = sizeof(CB); cbd.Usage = D3D11_USAGE_DYNAMIC;
@@ -226,12 +239,38 @@ bool load_model(const bmd::Model& model, int mode) {
         g_center = {0,0,0};
     }
 
-    for (auto& g : model.groups) {
+    // Create textures per model.textures (decoded in bmd_v2)
+    for(auto srv: g_texSRVs) if(srv) srv->Release();
+    g_texSRVs.assign(model.textures.size(), nullptr);
+    g_drawGroups.clear();
+    for(size_t ti=0; ti<model.textures.size(); ++ti){
+        auto &tex = model.textures[ti];
+        if(tex.decoded.empty() || tex.width==0 || tex.height==0) continue;
+        D3D11_TEXTURE2D_DESC td{}; td.Width=tex.width; td.Height=tex.height; td.MipLevels=1; td.ArraySize=1;
+        td.Format=DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count=1; td.Usage=D3D11_USAGE_IMMUTABLE; td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd{tex.decoded.data(), (UINT)(tex.width*4), (UINT)(tex.width*tex.height*4)};
+        ID3D11Texture2D* t2d=nullptr;
+        if(SUCCEEDED(g_dev->CreateTexture2D(&td,&sd,&t2d))){
+            g_dev->CreateShaderResourceView(t2d,nullptr,&g_texSRVs[ti]);
+            t2d->Release();
+        }
+    }
+    for (size_t gi=0; gi<model.groups.size(); ++gi) {
+        auto& g = model.groups[gi];
+        if(g_debug_group!=-1 && (int)gi != g_debug_group) {
+            // Still need to count verts for bbox, but skip index generation for debug
+            // For now, still generate but we will filter in render
+        }
+        uint32_t groupStartIdx = (uint32_t)idx.size();
+        // For debug, use white texture for all to isolate geometry vs texture
+        int texIdx = -1;
+        // if(g.tex_id != 0xFFFFFFFF && g.tex_id < (int)g_texSRVs.size() && g_texSRVs[g.tex_id]) texIdx = (int)g.tex_id;
+        DrawGroupInfo dgi; dgi.texIdx=texIdx; dgi.polyAttrib=g.poly_attribs; dgi.idxOffset=groupStartIdx;
         for (auto& p : g.prims) {
             uint32_t base = (uint32_t)verts.size();
             for (auto& v : p.verts) {
                 float px,py,pz,nx,ny,nz; apply_bone(v,g,px,py,pz,nx,ny,nz);
-                verts.push_back({px, py, pz, nx, ny, nz});
+                verts.push_back({px, py, pz, nx, ny, nz, v.u, v.v});
             }
             uint32_t n = (uint32_t)p.verts.size();
             auto add = [&](uint32_t a, uint32_t b, uint32_t c) { idx.push_back(base+a); idx.push_back(base+b); idx.push_back(base+c); };
@@ -242,8 +281,10 @@ bool load_model(const bmd::Model& model, int mode) {
             else if (p.type == bmd::PrimType::Quads)
                 for (uint32_t i=0;i+3<n;i+=4) { add(i,i+1,i+2); add(i,i+2,i+3); }
             else if (p.type == bmd::PrimType::QuadStrip)
-                for (uint32_t i=2;i+1<n;i+=2) { add(i-2,i,i+1); add(i-2,i+1,i-1); }
+                for (uint32_t i=2;i+1<n;i+=2) { add(i-2,i-1,i+1); add(i-2,i+1,i); }
         }
+        dgi.idxCount = (uint32_t)idx.size() - groupStartIdx;
+        g_drawGroups.push_back(dgi);
     }
     if (verts.empty()) return false;
     g_model_vcount=(UINT)verts.size(); g_model_icount=(UINT)idx.size();
@@ -259,6 +300,24 @@ bool load_model(const bmd::Model& model, int mode) {
     D3D11_SUBRESOURCE_DATA isd{idx.data(),0,0};
     if (FAILED(g_dev->CreateBuffer(&ibd,&isd,&g_model_ib))) return false;
 
+    // Create default white 1x1 texture and sampler (placeholder for per-material textures)
+    if(g_model_srv) g_model_srv->Release();
+    if(g_model_sampler) g_model_sampler->Release();
+    {
+        uint32_t white=0xFFFFFFFF;
+        D3D11_TEXTURE2D_DESC td{}; td.Width=1; td.Height=1; td.MipLevels=1; td.ArraySize=1;
+        td.Format=DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count=1; td.Usage=D3D11_USAGE_IMMUTABLE; td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd{&white,sizeof(uint32_t),sizeof(uint32_t)};
+        ID3D11Texture2D* tex=nullptr;
+        if(SUCCEEDED(g_dev->CreateTexture2D(&td,&sd,&tex))){
+            g_dev->CreateShaderResourceView(tex,nullptr,&g_model_srv);
+            tex->Release();
+        }
+        D3D11_SAMPLER_DESC sd2{}; sd2.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT; sd2.AddressU=D3D11_TEXTURE_ADDRESS_CLAMP; sd2.AddressV=D3D11_TEXTURE_ADDRESS_CLAMP; sd2.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd2.ComparisonFunc=D3D11_COMPARISON_NEVER; sd2.MinLOD=0; sd2.MaxLOD=D3D11_FLOAT32_MAX;
+        g_dev->CreateSamplerState(&sd2,&g_model_sampler);
+    }
+
     make_debug_geometry();
     focus_model();
     return true;
@@ -270,6 +329,38 @@ void focus_model() {
     g_yaw = 0.6f; g_pitch = 0.3f;
     make_debug_geometry();
 }
+
+// ---- Neutral mesh renderer ----
+struct PVertexColor { float x, y, z; float r, g, b, a; float u, v; };
+static ID3D11Buffer* g_neutral_vb = nullptr;
+static ID3D11Buffer* g_neutral_ib = nullptr;
+static UINT g_neutral_vcount = 0, g_neutral_icount = 0;
+static ID3D11VertexShader* g_neutral_vs = nullptr;
+static ID3D11PixelShader* g_neutral_ps = nullptr;
+static ID3D11InputLayout* g_neutral_layout = nullptr;
+static std::vector<uint32_t> g_neutral_submesh_starts;
+static std::vector<uint32_t> g_neutral_submesh_counts;
+static std::vector<int> g_neutral_submesh_matid;
+static std::vector<ID3D11ShaderResourceView*> g_neutral_texSRVs;
+static ID3D11SamplerState* g_neutral_sampler = nullptr;
+static bool g_neutral_loaded = false;
+
+static const char* k_neutral_vs_src =
+    "cbuffer CB : register(b0) { row_major float4x4 W; row_major float4x4 V; row_major float4x4 P; float4 Color; };\n"
+    "struct VIn { float3 p : POS; float4 c : COLOR; float2 t : TEXCOORD; };\n"
+    "struct VOut { float4 p : SV_Position; float4 c : COLOR; float2 t : TEXCOORD; };\n"
+    "VOut main(VIn i) { VOut o; float4 wp = mul(float4(i.p,1), W); "
+    "o.p = mul(mul(wp, V), P); o.c = i.c; o.t = i.t; return o; }\n";
+
+static const char* k_neutral_ps_src =
+    "Texture2D tex0 : register(t0); SamplerState samp0 : register(s0);\n"
+    "cbuffer CB : register(b0) { row_major float4x4 W; row_major float4x4 V; row_major float4x4 P; float4 Color; };\n"
+    "struct VOut { float4 p : SV_Position; float4 c : COLOR; float2 t : TEXCOORD; };\n"
+    "float4 main(VOut i) : SV_Target {\n"
+    "  float4 tc = tex0.Sample(samp0, i.t);\n"
+    "  if(tc.a < 0.1) discard;\n"
+    "  return float4(tc.rgb * i.c.rgb * Color.rgb, 1.0);\n"
+    "}\n";
 
 void render() {
     if (!g_ctx || !g_dev) return;
@@ -287,32 +378,88 @@ void render() {
 
     UINT stride = sizeof(PVertex), off = 0;
     g_ctx->IASetVertexBuffers(0, 1, &g_model_vb, &stride, &off);
-    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // Select primitive topology based on debug mode
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    if (g_primitive_mode == 1) topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    else if (g_primitive_mode == 2) topo = (D3D11_PRIMITIVE_TOPOLOGY)8; // QUADLIST (not in D3D11)
+    else if (g_primitive_mode == 3) topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    else if (g_primitive_mode == 4) topo = (D3D11_PRIMITIVE_TOPOLOGY)11; // QUADSTRIP (not in D3D11)
+    g_ctx->IASetPrimitiveTopology(topo);
     g_ctx->IASetInputLayout(g_layout);
     g_ctx->VSSetShader(g_vs, nullptr, 0);
     g_ctx->PSSetShader(g_ps, nullptr, 0);
+    if(g_model_srv) g_ctx->PSSetShaderResources(0,1,&g_model_srv);
+    if(g_model_sampler) g_ctx->PSSetSamplers(0,1,&g_model_sampler);
     g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
     g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
 
     CB cb; cb.W=W; cb.V=V; cb.P=P;
 
-    // solid model
-    if (g_render_mode == 1 || g_render_mode == 2) {
-        cb.color = XMFLOAT4(0.85f,0.85f,1.0f,0.0f);
-        D3D11_MAPPED_SUBRESOURCE map; g_ctx->Map(g_cb,0,D3D11_MAP_WRITE_DISCARD,0,&map);
-        std::memcpy(map.pData,&cb,sizeof(CB)); g_ctx->Unmap(g_cb,0);
-        D3D11_RASTERIZER_DESC rd{}; rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=D3D11_CULL_NONE;
-        ID3D11RasterizerState* rs=nullptr; g_dev->CreateRasterizerState(&rd,&rs); g_ctx->RSSetState(rs);
+    // solid model — per-group with texture and culling (SM64DSe BMD.cs:540)
+    if (g_neutral_loaded && g_neutral_vb && g_neutral_ib) {
+        // Neutral mesh rendering (textured)
+        UINT stride = sizeof(PVertexColor), off = 0;
+        g_ctx->IASetVertexBuffers(0, 1, &g_neutral_vb, &stride, &off);
+        g_ctx->IASetIndexBuffer(g_neutral_ib, DXGI_FORMAT_R32_UINT, 0);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->IASetInputLayout(g_neutral_layout);
+        g_ctx->VSSetShader(g_neutral_vs, nullptr, 0);
+        g_ctx->PSSetShader(g_neutral_ps, nullptr, 0);
+        g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
+        g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+        if (g_neutral_sampler) g_ctx->PSSetSamplers(0, 1, &g_neutral_sampler);
+
+        cb.color = XMFLOAT4(1, 1, 1, 1);
+
+        D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE;
+        rd.FrontCounterClockwise = TRUE;
+        ID3D11RasterizerState* rs = nullptr; g_dev->CreateRasterizerState(&rd, &rs); g_ctx->RSSetState(rs);
+
+        for (size_t si = 0; si < g_neutral_submesh_starts.size(); si++) {
+            int matid = (si < g_neutral_submesh_matid.size()) ? g_neutral_submesh_matid[si] : -1;
+            ID3D11ShaderResourceView* srv = nullptr;
+            if (matid >= 0 && matid < (int)g_neutral_texSRVs.size() && g_neutral_texSRVs[matid])
+                srv = g_neutral_texSRVs[matid];
+            g_ctx->PSSetShaderResources(0, 1, &srv);
+
+            D3D11_MAPPED_SUBRESOURCE map; g_ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
+            std::memcpy(map.pData, &cb, sizeof(CB)); g_ctx->Unmap(g_cb, 0);
+
+            g_ctx->DrawIndexed(g_neutral_submesh_counts[si], g_neutral_submesh_starts[si], 0);
+        }
+        if (rs) rs->Release();
+    } else if (g_render_mode == 1 || g_render_mode == 2) {
         g_ctx->IASetIndexBuffer(g_model_ib, DXGI_FORMAT_R32_UINT, 0);
-        g_ctx->DrawIndexed(g_model_icount,0,0);
-        if(rs) rs->Release();
+        for(size_t gi=0; gi<g_drawGroups.size(); ++gi){
+            auto &dg = g_drawGroups[gi];
+            if(g_debug_group!=-1 && (int)gi != g_debug_group) continue;
+            // Cull per poly_attrib — for debug, disable all culling
+            D3D11_CULL_MODE cull=D3D11_CULL_NONE;
+            // uint32_t ca=dg.polyAttrib & 0xC0;
+            // if(ca==0x40) cull=D3D11_CULL_FRONT;
+            // else if(ca==0x80) cull=D3D11_CULL_BACK;
+            // else if(ca==0x00) continue; // FrontAndBack — cull both => skip
+            // Texture per group
+            ID3D11ShaderResourceView* srv=nullptr;
+            if(dg.texIdx>=0 && dg.texIdx < (int)g_texSRVs.size() && g_texSRVs[dg.texIdx]) srv=g_texSRVs[dg.texIdx];
+            else srv=g_model_srv;
+            g_ctx->PSSetShaderResources(0,1,&srv);
+            if(g_model_sampler) g_ctx->PSSetSamplers(0,1,&g_model_sampler);
+            cb.color = XMFLOAT4(1,1,1,0);
+            D3D11_MAPPED_SUBRESOURCE map; g_ctx->Map(g_cb,0,D3D11_MAP_WRITE_DISCARD,0,&map);
+            std::memcpy(map.pData,&cb,sizeof(CB)); g_ctx->Unmap(g_cb,0);
+            D3D11_RASTERIZER_DESC rd{}; rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=cull; rd.FrontCounterClockwise=TRUE;
+            ID3D11RasterizerState* rs=nullptr; g_dev->CreateRasterizerState(&rd,&rs); g_ctx->RSSetState(rs);
+            g_ctx->DrawIndexed(dg.idxCount, dg.idxOffset, 0);
+            if(rs) rs->Release();
+        }
     }
     // wireframe model
     if (g_render_mode == 0 || g_render_mode == 2) {
         cb.color = XMFLOAT4(0.9f,0.5f,0.3f,0.0f);
         D3D11_MAPPED_SUBRESOURCE map; g_ctx->Map(g_cb,0,D3D11_MAP_WRITE_DISCARD,0,&map);
         std::memcpy(map.pData,&cb,sizeof(CB)); g_ctx->Unmap(g_cb,0);
-        D3D11_RASTERIZER_DESC rd{}; rd.FillMode=D3D11_FILL_WIREFRAME; rd.CullMode=D3D11_CULL_NONE;
+        D3D11_RASTERIZER_DESC rd{}; rd.FillMode=D3D11_FILL_WIREFRAME; rd.CullMode=D3D11_CULL_NONE; rd.FrontCounterClockwise=TRUE;
         ID3D11RasterizerState* rs=nullptr; g_dev->CreateRasterizerState(&rd,&rs); g_ctx->RSSetState(rs);
         g_ctx->IASetIndexBuffer(g_model_ib, DXGI_FORMAT_R32_UINT, 0);
         g_ctx->DrawIndexed(g_model_icount,0,0);
@@ -373,15 +520,147 @@ bool save_frame_bmp(const char* path) {
 }
 
 bool initialized() { return g_dev != nullptr; }
+void set_debug_group(int idx){ g_debug_group=idx; }
+int get_debug_group(){ return g_debug_group; }
+int get_primitive_mode(){ return g_primitive_mode; }
+void set_primitive_mode(int mode){ g_primitive_mode = mode; }
 void mouse_drag(int dx,int dy){ g_yaw+=dx*0.01f; g_pitch+=dy*0.01f; g_pitch=std::max(-1.5f,std::min(1.5f,g_pitch)); }
 void mouse_wheel(int delta){ g_dist=std::max(0.5f,std::min(500.0f,g_dist-delta*0.02f)); make_debug_geometry(); }
 void reset_camera(){ g_yaw=0.6f; g_pitch=0.3f; }
 
+bool load_neutral_mesh(const NeutralMesh& mesh, int mode) {
+    if (!g_dev || mesh.empty()) return false;
+
+    // Release old neutral mesh resources
+    if (g_neutral_vb) { g_neutral_vb->Release(); g_neutral_vb = nullptr; }
+    if (g_neutral_ib) { g_neutral_ib->Release(); g_neutral_ib = nullptr; }
+    g_neutral_submesh_starts.clear();
+    g_neutral_submesh_counts.clear();
+    g_neutral_loaded = false;
+
+    // Create neutral shaders if not yet created
+    if (!g_neutral_vs) {
+        ID3DBlob* vsb = nullptr; ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
+        HRESULT hr = D3DCompile(k_neutral_vs_src, strlen(k_neutral_vs_src), nullptr, nullptr, nullptr,
+                                "main", "vs_4_0", 0, 0, &vsb, &err);
+        if (FAILED(hr)) { if (err) err->Release(); return false; }
+        hr = D3DCompile(k_neutral_ps_src, strlen(k_neutral_ps_src), nullptr, nullptr, nullptr,
+                        "main", "ps_4_0", 0, 0, &psb, &err);
+        if (FAILED(hr)) { if (err) err->Release(); return false; }
+        g_dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_neutral_vs);
+        g_dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_neutral_ps);
+        D3D11_INPUT_ELEMENT_DESC desc[] = {
+            {"POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        };
+        g_dev->CreateInputLayout(desc, 3, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_neutral_layout);
+    }
+
+    // Convert NeutralMesh to GPU buffers
+    std::vector<PVertexColor> verts;
+    verts.reserve(mesh.vertices.size());
+    for (auto& v : mesh.vertices) {
+        PVertexColor pv;
+        pv.x = v.pos[0]; pv.y = v.pos[1]; pv.z = v.pos[2];
+        pv.r = v.color[0] / 255.0f;
+        pv.g = v.color[1] / 255.0f;
+        pv.b = v.color[2] / 255.0f;
+        pv.a = v.color[3] / 255.0f;
+        pv.u = v.uv[0]; pv.v = v.uv[1];
+        verts.push_back(pv);
+    }
+    std::vector<uint32_t> indices = mesh.indices;
+
+    g_neutral_vcount = (UINT)verts.size();
+    g_neutral_icount = (UINT)indices.size();
+
+    D3D11_BUFFER_DESC vbd{};
+    vbd.ByteWidth = (UINT)(verts.size() * sizeof(PVertexColor));
+    vbd.Usage = D3D11_USAGE_IMMUTABLE; vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA vsd{verts.data(), 0, 0};
+    if (FAILED(g_dev->CreateBuffer(&vbd, &vsd, &g_neutral_vb))) return false;
+
+    D3D11_BUFFER_DESC ibd{};
+    ibd.ByteWidth = (UINT)(indices.size() * sizeof(uint32_t));
+    ibd.Usage = D3D11_USAGE_IMMUTABLE; ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA isd{indices.data(), 0, 0};
+    if (FAILED(g_dev->CreateBuffer(&ibd, &isd, &g_neutral_ib))) return false;
+
+    // Store submesh ranges and material IDs
+    for (auto& sm : mesh.submeshes) {
+        g_neutral_submesh_starts.push_back((uint32_t)sm.index_start);
+        g_neutral_submesh_counts.push_back((uint32_t)sm.index_count);
+        g_neutral_submesh_matid.push_back(sm.material_id);
+    }
+
+    // Load material textures via stb_image
+    for (auto srv : g_neutral_texSRVs) if (srv) srv->Release();
+    g_neutral_texSRVs.clear();
+    g_neutral_texSRVs.resize(mesh.materials.size(), nullptr);
+    for (size_t i = 0; i < mesh.materials.size(); i++) {
+        auto& m = mesh.materials[i];
+        if (m.diffuse_tex.empty()) continue;
+        std::string full = "D:\\DescompDS\\test_export\\" + m.diffuse_tex;
+        int w = 0, h = 0, ch = 0;
+        unsigned char* pixels = stbi_load(full.c_str(), &w, &h, &ch, 4);
+        if (!pixels || w == 0 || h == 0) {
+            if (pixels) stbi_image_free(pixels);
+            continue;
+        }
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd{pixels, (UINT)(w * 4), (UINT)(w * h * 4)};
+        ID3D11Texture2D* t2d = nullptr;
+        if (SUCCEEDED(g_dev->CreateTexture2D(&td, &sd, &t2d))) {
+            g_dev->CreateShaderResourceView(t2d, nullptr, &g_neutral_texSRVs[i]);
+            t2d->Release();
+        }
+        stbi_image_free(pixels);
+    }
+
+    // Create sampler
+    if (!g_neutral_sampler) {
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+        sd.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+        sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0; sd.MaxLOD = D3D11_FLOAT32_MAX;
+        g_dev->CreateSamplerState(&sd, &g_neutral_sampler);
+    }
+
+    g_neutral_loaded = true;
+    g_render_mode = mode;
+
+    // Frame the model
+    float dx = mesh.bbox_max[0] - mesh.bbox_min[0];
+    float dy = mesh.bbox_max[1] - mesh.bbox_min[1];
+    float dz = mesh.bbox_max[2] - mesh.bbox_min[2];
+    g_center = XMFLOAT3(
+        (mesh.bbox_min[0] + mesh.bbox_max[0]) * 0.5f,
+        (mesh.bbox_min[1] + mesh.bbox_max[1]) * 0.5f,
+        (mesh.bbox_min[2] + mesh.bbox_max[2]) * 0.5f);
+    float radius = std::sqrt(dx*dx + dy*dy + dz*dz) * 0.5f;
+    if (radius < 0.001f) radius = 1.0f;
+    g_dist = radius * 3.0f;
+    focus_model();
+
+    return true;
+}
+
 void shutdown() {
+    if(g_neutral_vb)g_neutral_vb->Release(); if(g_neutral_ib)g_neutral_ib->Release();
+    if(g_neutral_vs)g_neutral_vs->Release(); if(g_neutral_ps)g_neutral_ps->Release();
+    if(g_neutral_layout)g_neutral_layout->Release();
     if(g_dbg_vb)g_dbg_vb->Release(); if(g_model_ib)g_model_ib->Release(); if(g_model_vb)g_model_vb->Release();
     if(g_ib)g_ib->Release(); if(g_vb)g_vb->Release(); if(g_cb)g_cb->Release();
     if(g_layout)g_layout->Release(); if(g_ps)g_ps->Release(); if(g_vs)g_vs->Release();
     g_dsv->Release(); g_rtv->Release(); g_swap->Release(); g_ctx->Release(); g_dev->Release();
+    g_neutral_vb=nullptr; g_neutral_ib=nullptr; g_neutral_vs=nullptr; g_neutral_ps=nullptr; g_neutral_layout=nullptr;
     g_dbg_vb=nullptr; g_model_ib=nullptr; g_model_vb=nullptr; g_ib=nullptr; g_vb=nullptr; g_cb=nullptr;
     g_layout=nullptr; g_ps=nullptr; g_vs=nullptr; g_dsv=nullptr; g_rtv=nullptr;
     g_swap=nullptr; g_ctx=nullptr; g_dev=nullptr;
